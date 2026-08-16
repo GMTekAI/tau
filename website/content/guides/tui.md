@@ -13,8 +13,10 @@ Type into the prompt box at the bottom and press **Enter** to submit. The editor
 keeps its padded block size and background, while a single left border changes
 color to reflect focus, shell mode, and active runs without boxing it in.
 **Shift+Enter** inserts a newline for multi-line prompts. Tau streams the
-assistant's reply above the prompt, showing tool calls as they run. In supported
-terminal emulators, Tau also updates the tab title: named sessions show as
+assistant's reply above the prompt, showing tool calls as they run. When OpenAI
+returns several reasoning-summary parts, Tau keeps them as separate Markdown
+paragraphs rather than joining their headings together. In supported terminal
+emulators, Tau also updates the tab title: named sessions show as
 `τ | <name>`, and active runs add an animated running indicator so you can see
 work continuing from another tab. When a run fully settles while Tau's terminal
 surface is unfocused, Tau emits a desktop notification by default on supported
@@ -111,23 +113,42 @@ first, such as the macOS Dock's Downloads stack.
 ## Tool output
 
 Tool calls keep a static marker in the transcript while they run: orange means
-in progress, green means success, and red means failure. The prompt-area activity
+in progress, green means success, and red means failure. That status color applies
+to the semantic description, such as `Running tests` or `Read 5 files`; command
+snippets, arguments, and file lists stay neutral gray. The prompt-area activity
 indicator provides the run-wide animation without adding a second spinner to each
 tool row.
 
-Tool results (like long `read` or `bash` output) render as compact previews so
-the transcript stays readable. Tau asks the model to give each `bash` call a brief
-description such as `Running tests`. Long or multiline calls pair that description
-with a short prefix taken from the real command, so model-generated text is always
-accompanied by deterministic command text. Short shell commands remain visible and ignore the
-description. Calls without a description use a deterministic fallback: multiline
-commands and heredocs show their first line plus a line count, inline code shows
-its interpreter plus a character count, and other commands over 120 characters
-show a shortened preview.
+Adjacent built-in tool calls from one model response share one transcript block,
+with one compact line per logical action. Each line retains its own status color,
+and adjacent reads or edits remain clustered under one headline with every file
+path listed beneath it. Expanded edit groups retain each invocation and result;
+expanded read groups omit repeated file contents. The complete block remains one selectable text surface,
+including across line boundaries.
+Batches never cross assistant text, model continuations, or separate responses;
+extension tools, custom rendered call cards, and skill loads remain separate.
 
-Toggle the exact commands and full tool output with **Ctrl+O**. Command compaction
-affects only the TUI display; execution, session history, and print-mode
-transcripts retain the complete command.
+Tool results (like long `read` or `bash` output) render as compact previews so
+the transcript stays readable. Tau requires the model to give each `bash` call a
+brief description such as `Running tests`. Tau shows that description in full;
+collapsed rows never show command text. Press **Ctrl+O** to keep the description
+visible and reveal the exact command
+and result beneath it. Malformed provider output,
+custom integrations, and older sessions can still lack a description; those calls
+show the generic `Running shell command` label until expanded.
+
+When one model response reads or edits several files, adjacent calls of the same
+type share one group. The group lists every path, reports progress as results
+arrive, and shows an aggregate failure count when needed. Calls from different
+model responses are never combined; shell calls and extension tools remain
+separate.
+
+Toggle grouped reads into their individual call list with **Ctrl+O**. Grouped read
+rows omit file-content previews even when expanded, keeping the transcript focused
+on which files were read. The same toggle reveals exact shell commands and full
+output for other tools. Compaction and grouping affect only the TUI display;
+execution, session history, and print-mode transcripts retain every complete call
+and result.
 
 Markdown link hover styling underlines only the linked text, never the rest of its
 row. User message blocks use the same theme background as the prompt field and sidebar,

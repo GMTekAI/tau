@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 from textual import events
 from textual.color import Color
 from textual.containers import Container, VerticalScroll
@@ -1519,7 +1520,7 @@ def test_expanded_tool_invocation_blank_line_stays_separate_from_result() -> Non
     assert "\x1b[91" not in console.export_text(styles=True)
 
 
-def test_pending_tool_invocation_uses_tool_accent_color() -> None:
+def test_pending_tool_invocation_colors_tool_name_but_not_arguments() -> None:
     console = Console(record=True, width=80)
     item = ChatItem(role="tool", text="→ read README.md")
     console.print(
@@ -1534,11 +1535,13 @@ def test_pending_tool_invocation_uses_tool_accent_color() -> None:
     output = console.export_text(styles=True)
 
     accent = "38;2;138;122;82;48;2;0;0;0m"
+    body = "38;2;203;213;225;48;2;0;0;0m"
     assert f"{accent}read" in output
-    assert f"{accent} README.md" in output
+    assert f"{body} README.md" in output
+    assert f"{accent} README.md" not in output
 
 
-def test_tool_chat_items_color_status_metadata_not_tool_name_or_results() -> None:
+def test_tool_chat_items_color_description_not_details_or_results() -> None:
     success_console = Console(record=True, width=80)
     success_console.print(
         render_chat_item(
@@ -1562,8 +1565,9 @@ def test_tool_chat_items_color_status_metadata_not_tool_name_or_results() -> Non
     white = "38;2;203;213;225"
 
     assert green in success_output
-    assert f"{white};48;2;0;0;0mread" in success_output
-    assert f"{green};48;2;0;0;0mread" not in success_output
+    assert f"{green};48;2;0;0;0mread" in success_output
+    assert f"{white};48;2;0;0;0m README.md" in success_output
+    assert f"{green};48;2;0;0;0m README.md" not in success_output
     assert f"{green};48;2;0;0;0m✓ read" not in success_output
     assert f"{green};48;2;0;0;0mcontents" not in success_output
 
@@ -1571,6 +1575,139 @@ def test_tool_chat_items_color_status_metadata_not_tool_name_or_results() -> Non
     assert f"{white};48;2;0;0;0m✗ bash" in error_output
     assert f"{red};48;2;0;0;0m✗ bash" not in error_output
     assert f"{red};48;2;0;0;0mfailed" not in error_output
+
+
+def test_grouped_read_details_stay_neutral() -> None:
+    green = "38;2;156;255;177;48;2;0;0;0m"
+    body = "38;2;203;213;225;48;2;0;0;0m"
+    text = "→ Read 5 files\n  - a.py\n  - b.py\n  - c.py\n  - d.py\n  - e.py"
+    console = Console(record=True, width=100, color_system="truecolor")
+    item = ChatItem(role="tool", text=text, tool_result_text="✓ tool")
+    console.print(
+        _transcript_plain_body_text(
+            item,
+            text=text,
+            body_style=TAU_DARK_THEME.role_styles["tool"].body,
+            theme=TAU_DARK_THEME,
+        )
+    )
+    output = console.export_text(styles=True)
+
+    assert f"{green}Read 5 files" in output
+    assert f"{body}  - a.py" in output
+    assert f"{body}  - e.py" in output
+    assert f"{green}  - a.py" not in output
+
+
+def test_bash_description_without_command_keeps_full_status_color() -> None:
+    command = "echo " + "x" * 120
+    item = ChatItem(
+        role="tool",
+        text="→ Running long command",
+        tool_name="bash",
+        tool_arguments={"command": command, "description": "Running long command"},
+        tool_result_text="✓ bash",
+    )
+    console = Console(record=True, width=100, color_system="truecolor")
+    console.print(
+        _transcript_plain_body_text(
+            item,
+            text=item.text,
+            body_style=TAU_DARK_THEME.role_styles["tool"].body,
+            theme=TAU_DARK_THEME,
+        )
+    )
+
+    output = console.export_text(styles=True)
+    assert "38;2;156;255;177;48;2;0;0;0mRunning long command" in output
+    assert command not in console.export_text()
+
+
+def test_tool_batch_colors_each_description_by_its_own_status() -> None:
+    item = ChatItem(
+        role="tool",
+        text="batch",
+        tool_result_text="✗ tool batch",
+        tool_batch_items=[
+            ChatItem(
+                role="tool",
+                text="→ Finished action",
+                tool_name="bash",
+                tool_result_text="✓ bash",
+            ),
+            ChatItem(
+                role="tool",
+                text="→ Failed action",
+                tool_name="bash",
+                tool_result_text="✗ bash",
+            ),
+            ChatItem(
+                role="tool",
+                text="→ Running action",
+                tool_name="bash",
+                started_at=1.0,
+            ),
+        ],
+    )
+    console = Console(record=True, width=100, color_system="truecolor")
+    console.print(
+        _transcript_plain_body_text(
+            item,
+            text=item.text,
+            body_style=TAU_DARK_THEME.role_styles["tool"].body,
+            theme=TAU_DARK_THEME,
+        )
+    )
+    output = console.export_text(styles=True)
+
+    assert "38;2;156;255;177;48;2;0;0;0mFinished action" in output
+    assert "38;2;255;79;79;48;2;0;0;0mFailed action" in output
+    assert "38;2;138;122;82;48;2;0;0;0mRunning action" in output
+    assert "$ false" not in console.export_text()
+
+
+def test_partially_completed_read_group_keeps_running_color() -> None:
+    item = ChatItem(
+        role="tool",
+        text="→ Reading 2 files · 1/2 complete\n  - a.py\n  - b.py",
+        tool_name="read",
+        tool_result_text="… read group",
+        started_at=1.0,
+    )
+    console = Console(record=True, width=100, color_system="truecolor")
+    console.print(
+        _transcript_plain_body_text(
+            item,
+            text=item.text,
+            body_style=TAU_DARK_THEME.role_styles["tool"].body,
+            theme=TAU_DARK_THEME,
+        )
+    )
+
+    output = console.export_text(styles=True)
+    running_color = _style_color_escape(TAU_DARK_THEME.role_styles["tool"].border)
+    assert f"{running_color};48;2;0;0;0mReading 2 files" in output
+
+
+def test_tool_batch_body_stays_one_selectable_text_renderable() -> None:
+    item = ChatItem(
+        role="tool",
+        text="batch",
+        tool_batch_items=[
+            ChatItem(role="tool", text="→ First action", tool_name="bash"),
+            ChatItem(role="tool", text="→ Second action", tool_name="bash"),
+        ],
+    )
+
+    body = _transcript_plain_body_text(
+        item,
+        text=item.text,
+        body_style=TAU_DARK_THEME.role_styles["tool"].body,
+        theme=TAU_DARK_THEME,
+    )
+
+    assert isinstance(body, Text)
+    assert body.plain == "→ First action\n→ Second action"
 
 
 def test_assistant_chat_items_render_markdown_lists() -> None:
@@ -1769,6 +1906,117 @@ async def test_tool_execution_updates_render_in_place() -> None:
         tool_widgets = [w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool"]
         assert len(tool_widgets) == 1
         assert "turn 2 done" not in tool_widgets[0].selection_text
+
+
+@pytest.mark.anyio
+async def test_batched_reads_share_one_live_transcript_row() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async def stream(event: AgentEvent) -> None:
+        app.adapter.apply(event)
+        await app._apply_streaming_transcript_event(event)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        await stream(
+            MessageEndEvent(
+                message=AssistantMessage(
+                    content=[
+                        ToolCall(id="call-1", name="read", arguments={"path": "a.py"}),
+                        ToolCall(id="call-2", name="read", arguments={"path": "b.py"}),
+                    ]
+                )
+            )
+        )
+        await stream(
+            ToolExecutionStartEvent(tool_call_id="call-1", tool_name="read", args={"path": "a.py"})
+        )
+        await stream(
+            ToolExecutionStartEvent(tool_call_id="call-2", tool_name="read", args={"path": "b.py"})
+        )
+        await pilot.pause()
+
+        tool_widgets = [w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool"]
+        assert len(tool_widgets) == 1
+        assert tool_widgets[0].selection_text == "→ Reading 2 files\n  - a.py\n  - b.py"
+
+        await stream(
+            ToolExecutionEndEvent(
+                tool_call_id="call-1",
+                tool_name="read",
+                result=AgentToolResult(content="one"),
+                is_error=False,
+            )
+        )
+        await pilot.pause()
+        assert tool_widgets[0].selection_text == (
+            "→ Reading 2 files · 1/2 complete\n  - a.py\n  - b.py"
+        )
+
+        await stream(
+            ToolExecutionEndEvent(
+                tool_call_id="call-2",
+                tool_name="read",
+                result=AgentToolResult(content="two"),
+                is_error=False,
+            )
+        )
+        await pilot.pause()
+        assert tool_widgets[0].selection_text == "→ Read 2 files\n  - a.py\n  - b.py"
+
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert tool_widgets[0].selection_text == "→ read a.py\n→ read b.py"
+        assert "one" not in tool_widgets[0].selection_text
+        assert "two" not in tool_widgets[0].selection_text
+
+
+@pytest.mark.anyio
+async def test_mixed_tool_batch_uses_one_widget_and_expands_each_row() -> None:
+    app = TauTuiApp(
+        FakeSession(
+            messages=[
+                AssistantMessage(
+                    content=[
+                        ToolCall(
+                            id="bash-1",
+                            name="bash",
+                            arguments={"command": "echo one", "description": "Doing thing one"},
+                        ),
+                        ToolCall(id="read-1", name="read", arguments={"path": "a.py"}),
+                        ToolCall(id="read-2", name="read", arguments={"path": "b.py"}),
+                        ToolCall(
+                            id="bash-2",
+                            name="bash",
+                            arguments={"command": "echo two", "description": "Doing thing two"},
+                        ),
+                    ]
+                ),
+                ToolResultMessage(tool_call_id="bash-1", tool_name="bash", content="one"),
+                ToolResultMessage(tool_call_id="read-1", tool_name="read", content="alpha"),
+                ToolResultMessage(tool_call_id="read-2", tool_name="read", content="beta"),
+                ToolResultMessage(tool_call_id="bash-2", tool_name="bash", content="two"),
+            ]
+        )
+    )
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        widget = next(w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool")
+        assert len([w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool"]) == 1
+        assert widget.selection_text == (
+            "→ Doing thing one\n→ Read 2 files\n  - a.py\n  - b.py\n→ Doing thing two"
+        )
+
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+
+        assert widget.selection_text == (
+            "→ Doing thing one\n$ echo one\n\n✓ bash\none\n\n"
+            "→ read a.py\n→ read b.py\n\n"
+            "→ Doing thing two\n$ echo two\n\n✓ bash\ntwo"
+        )
+        assert "alpha" not in widget.selection_text
+        assert "beta" not in widget.selection_text
 
 
 @pytest.mark.anyio
@@ -7250,13 +7498,15 @@ async def test_tool_result_toggle_expands_full_bash_command() -> None:
 
     async with app.run_test() as pilot:
         widget = next(w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool")
-        assert widget.selection_text == "→ Running inline script · $ python - <<'PY'"
+        assert widget.selection_text == "→ Running inline script"
 
         await pilot.press("ctrl+o")
         await pilot.pause()
 
         widget = next(w for w in app.query(TranscriptMessageWidget) if w.item.role == "tool")
-        assert widget.selection_text == f"$ {command}\n\n✓ bash\nfinished"
+        assert widget.selection_text == (
+            f"→ Running inline script\n$ {command}\n\n✓ bash\nfinished"
+        )
 
 
 @pytest.mark.anyio

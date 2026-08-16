@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,14 +32,20 @@ from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets import Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
-from tau_agent.tools import AgentTool
+from tau_agent.tools import AgentTool, ToolCall
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.session_stats import SessionStats
 from tau_coding.skills import Skill
 from tau_coding.system_prompt import ProjectContextFile
 from tau_coding.tui.autocomplete import CompletionState
 from tau_coding.tui.config import TAU_DARK_THEME, TuiRoleStyle, TuiTheme
-from tau_coding.tui.state import ChatItem, TuiState
+from tau_coding.tui.state import (
+    TOOL_TIMER_MIN_SECONDS,
+    ChatItem,
+    TuiState,
+    format_elapsed,
+    format_tool_call_invocation,
+)
 from tau_coding.version import current_version
 
 TAU_SIDEBAR_LOGO = "τ = 2π"
@@ -1315,6 +1323,8 @@ def transcript_item_selection_text(
     """Return the plain text represented by a selectable transcript item."""
     if item.role == "custom":
         return _custom_selection_text(custom_markup, item.text)
+    if item.role == "tool" and item.tool_batch_items is not None:
+        return _tool_batch_selection_text(item, expanded=show_tool_results)
     if item.role == "tool" and result_markup is not None:
         # A tool-rendered result replaces the generic block: invocation line
         # plus the markup-stripped card.
@@ -1384,12 +1394,22 @@ def _transcript_plain_body_text(
     """Return styled transcript text for selectable plain rows."""
     if item.role != "tool":
         return Text(text, style=body_style, overflow="fold", no_wrap=False)
+    if item.tool_batch_items is not None:
+        return _render_transcript_tool_batch(
+            item,
+            body_style=body_style,
+            theme=theme,
+            expanded=show_tool_results,
+        )
 
     invocation_text = _render_transcript_tool_invocation(
         invocation if invocation else item.text,
         body_style=body_style,
         accent_style=_tool_accent_style(item, theme=theme),
+        description_only=_bash_row_is_description_only(item),
     )
+    if item.grouped_tool_calls is not None:
+        return invocation_text
     if result_markup is not None:
         # The tool's `render_result` markup replaces the generic result block;
         # the invocation line keeps its usual status-accented rendering.
@@ -1427,15 +1447,15 @@ def _render_transcript_tool_invocation(
     *,
     body_style: str,
     accent_style: str | None,
+    description_only: bool = False,
 ) -> Text:
-    """Render a selectable tool invocation with status color after the prefix."""
-    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
-    accent_style = accent_style or body_style
-    prefix, name, remainder = _split_tool_invocation(text)
-    rendered.append(prefix, style=body_style)
-    rendered.append(name, style=accent_style)
-    rendered.append(remainder, style=accent_style)
-    return rendered
+    """Render tool descriptions in status color and argument details in gray."""
+    return _styled_tool_invocation(
+        text,
+        body_style=body_style,
+        accent_style=accent_style,
+        description_only=description_only,
+    )
 
 
 def _transcript_item_markdown(
@@ -1666,13 +1686,87 @@ def _tool_accent_style(item: ChatItem, *, theme: TuiTheme) -> str | None:
     # style, so it blends with any theme's transcript background.
     if item.role != "tool":
         return None
-    if item.tool_result_text is None:
+    if item.tool_result_text is None or item.tool_result_text.startswith("…"):
         return theme.role_styles["tool"].border
     if item.tool_result_text.startswith("✓"):
         return theme.tool_success_text
     if item.tool_result_text.startswith("✗"):
         return theme.tool_error_text
     return None
+
+
+def _bash_row_is_description_only(item: ChatItem) -> bool:
+    return item.tool_name == "bash" and item.text.startswith("→ ")
+
+
+def _tool_batch_row_invocation(row: ChatItem, *, expanded: bool) -> str:
+    if row.grouped_tool_calls is not None:
+        if expanded:
+            blocks = []
+            for member in row.grouped_tool_calls:
+                block = member.text
+                if row.tool_name == "edit" and member.tool_result_text is not None:
+                    block = f"{block}\n\n{member.tool_result_text}"
+                blocks.append(block)
+            return ("\n\n" if row.tool_name == "edit" else "\n").join(blocks)
+        return row.text
+    if expanded and row.tool_name == "bash":
+        exact_command = format_tool_call_invocation(
+            ToolCall(
+                id=row.tool_call_id or "display-call",
+                name=row.tool_name,
+                arguments=row.tool_arguments or {},
+            ),
+            expanded=True,
+        )
+        invocation = f"{row.text}\n{exact_command}"
+    else:
+        invocation = row.text
+    if row.tool_result_text is None and row.started_at is not None:
+        elapsed = time.monotonic() - row.started_at
+        if elapsed >= TOOL_TIMER_MIN_SECONDS:
+            return f"{invocation} ({format_elapsed(elapsed)})"
+    return invocation
+
+
+def _tool_batch_selection_text(item: ChatItem, *, expanded: bool) -> str:
+    rows: list[str] = []
+    for row in item.tool_batch_items or []:
+        text = _tool_batch_row_invocation(row, expanded=expanded)
+        if expanded and row.grouped_tool_calls is None and row.tool_result_text:
+            text = f"{text}\n\n{row.tool_result_text}"
+        elif row.update_text and not row.tool_result_text:
+            text = f"{text}\n… {row.update_text}"
+        rows.append(text)
+    return ("\n\n" if expanded else "\n").join(rows)
+
+
+def _render_transcript_tool_batch(
+    item: ChatItem,
+    *,
+    body_style: str,
+    theme: TuiTheme,
+    expanded: bool,
+) -> Text:
+    """Render a batch as one selectable Text value with per-row style spans."""
+    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+    for index, row in enumerate(item.tool_batch_items or []):
+        if index:
+            rendered.append("\n\n" if expanded else "\n", style=body_style)
+        rendered.append(
+            _styled_tool_invocation(
+                _tool_batch_row_invocation(row, expanded=expanded),
+                body_style=body_style,
+                accent_style=_tool_accent_style(row, theme=theme),
+                description_only=_bash_row_is_description_only(row),
+            )
+        )
+        if expanded and row.grouped_tool_calls is None and row.tool_result_text:
+            rendered.append("\n\n", style=body_style)
+            rendered.append(row.tool_result_text, style=body_style)
+        elif row.update_text and not row.tool_result_text:
+            rendered.append(f"\n… {row.update_text}", style=body_style)
+    return rendered
 
 
 def _render_tool_chat_body(
@@ -1684,8 +1778,20 @@ def _render_tool_chat_body(
     syntax_theme: str,
     theme: TuiTheme,
 ) -> RenderableType:
-    text = _render_tool_invocation(item.text, body_style=body_style, accent_style=accent_style)
-    if not show_tool_results or not item.tool_result_text:
+    if item.tool_batch_items is not None:
+        return _render_transcript_tool_batch(
+            item,
+            body_style=body_style,
+            theme=theme,
+            expanded=show_tool_results,
+        )
+    text = _render_tool_invocation(
+        item.text,
+        body_style=body_style,
+        accent_style=accent_style,
+        description_only=_bash_row_is_description_only(item),
+    )
+    if item.grouped_tool_calls is not None or not show_tool_results or not item.tool_result_text:
         return text
 
     result_body = _render_chat_body(
@@ -1698,25 +1804,66 @@ def _render_tool_chat_body(
     return Group(text, Text(""), result_body)
 
 
-def _render_tool_invocation(text: str, *, body_style: str, accent_style: str | None) -> Text:
+def _render_tool_invocation(
+    text: str,
+    *,
+    body_style: str,
+    accent_style: str | None,
+    description_only: bool = False,
+) -> Text:
+    return _styled_tool_invocation(
+        text,
+        body_style=body_style,
+        accent_style=accent_style,
+        description_only=description_only,
+    )
+
+
+_TOOL_GROUP_INVOCATION_PATTERN = re.compile(
+    r"^→ ((?:Reading|Read|Editing|Edited) \d+ files"
+    r"(?: · (?:\d+/\d+ complete|\d+ failed))?)(?: · (.+))?$"
+)
+
+
+def _styled_tool_invocation(
+    text: str,
+    *,
+    body_style: str,
+    accent_style: str | None,
+    description_only: bool = False,
+) -> Text:
     rendered = Text(style=body_style, overflow="fold", no_wrap=False)
     accent_style = accent_style or body_style
-    prefix, name, remainder = _split_tool_invocation(text)
-    rendered.append(prefix, style=body_style)
-    rendered.append(name, style=body_style)
-    rendered.append(remainder, style=accent_style)
+    for index, line in enumerate(text.splitlines() or [""]):
+        if index:
+            rendered.append("\n", style=body_style)
+        prefix, description, details = _split_tool_invocation_sections(
+            line, description_only=description_only
+        )
+        rendered.append(prefix, style=body_style)
+        rendered.append(description, style=accent_style)
+        rendered.append(details, style=body_style)
     return rendered
 
 
-def _split_tool_invocation(text: str) -> tuple[str, str, str]:
+def _split_tool_invocation_sections(
+    text: str, *, description_only: bool = False
+) -> tuple[str, str, str]:
+    """Split an invocation into neutral prefix, status description, and gray details."""
+    if description_only and text.startswith("→ "):
+        return "→ ", text[2:], ""
+    group = _TOOL_GROUP_INVOCATION_PATTERN.fullmatch(text)
+    if group is not None:
+        details = f" · {group.group(2)}" if group.group(2) is not None else ""
+        return "→ ", group.group(1), details
     if text.startswith("→ "):
         rest = text[2:]
-        name, separator, remainder = rest.partition(" ")
-        return "→ ", name, f"{separator}{remainder}" if separator else ""
-    if text.startswith("$ "):
-        return "$", "", text[1:]
-    name, separator, remainder = text.partition(" ")
-    return "", name, f"{separator}{remainder}" if separator else ""
+        description, separator, command = rest.rpartition(" · $ ")
+        if separator:
+            return "→ ", description, f"{separator}{command}"
+        name, space, arguments = rest.partition(" ")
+        return "→ ", name, f"{space}{arguments}" if space else ""
+    return "", "", text
 
 
 def _visible_chat_text(
@@ -1735,7 +1882,11 @@ def _visible_chat_text(
         return item.text
     if item.role not in {"tool", "skill"}:
         return item.text
+    if item.role == "tool" and item.tool_batch_items is not None:
+        return _tool_batch_selection_text(item, expanded=show_tool_results)
     text = invocation if item.role == "tool" and invocation else item.text
+    if item.grouped_tool_calls is not None:
+        return text
     if show_tool_results and item.tool_result_text:
         return f"{text}\n\n{item.tool_result_text}"
     if item.update_text and not item.tool_result_text:
