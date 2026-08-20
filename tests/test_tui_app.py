@@ -3213,6 +3213,17 @@ async def test_tui_sidebar_hides_on_narrow_windows() -> None:
 
 
 @pytest.mark.anyio
+async def test_prompt_renders_when_narrow_layout_has_no_content_width() -> None:
+    """A narrow pane can briefly give the prompt zero content cells."""
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(3, 10)):
+        prompt = app.query_one("#prompt", PromptInput)
+        assert prompt.content_size.width == 0
+        prompt.render_line(0)
+
+
+@pytest.mark.anyio
 async def test_tui_sidebar_hides_on_short_windows() -> None:
     app = TauTuiApp(FakeSession())
 
