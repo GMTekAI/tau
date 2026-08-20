@@ -2066,6 +2066,7 @@ class CodingSession:
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
         events: AsyncIterator[AgentEvent] | None = None
+        settled_event: AgentSettledEvent | None = None
         auto_name_attempted = False
         overflow_message: AssistantMessage | None = None
         try:
@@ -2162,14 +2163,8 @@ class CodingSession:
                     session_event_4 = AutoRetryEndEvent(success=True, attempt=1, final_error=None)
                     await self._extension_runtime.emit_event(session_event_4)
                     yield session_event_4
-                session_event_5 = AgentSettledEvent()
-                await self._extension_runtime.emit_event(session_event_5)
-                yield session_event_5
-                return
-            await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
-            session_event_5 = AgentSettledEvent()
-            await self._extension_runtime.emit_event(session_event_5)
-            yield session_event_5
+            else:
+                await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -2178,7 +2173,13 @@ class CodingSession:
             )
             raise
         finally:
-            await self._reconcile_run_persistence(events, context=context)
+            try:
+                await self._reconcile_run_persistence(events, context=context)
+            finally:
+                if events is not None:
+                    settled_event = await self._dispatch_agent_settled()
+        if settled_event is not None:
+            yield settled_event
 
     async def continue_(self) -> AsyncIterator[CodingSessionEvent]:
         """Continue the agent from restored state and persist new messages."""
@@ -2189,6 +2190,7 @@ class CodingSession:
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
         events: AsyncIterator[AgentEvent] | None = None
+        settled_event: AgentSettledEvent | None = None
         try:
             events = self._harness.continue_()
             self._invalidate_context_usage_cache()
@@ -2210,9 +2212,6 @@ class CodingSession:
                 else:
                     yield event
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
-            session_event_5 = AgentSettledEvent()
-            await self._extension_runtime.emit_event(session_event_5)
-            yield session_event_5
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -2221,7 +2220,19 @@ class CodingSession:
             )
             raise
         finally:
-            await self._reconcile_run_persistence(events, context=context)
+            try:
+                await self._reconcile_run_persistence(events, context=context)
+            finally:
+                if events is not None:
+                    settled_event = await self._dispatch_agent_settled()
+        if settled_event is not None:
+            yield settled_event
+
+    async def _dispatch_agent_settled(self) -> AgentSettledEvent:
+        """Dispatch and return the final session event for one started run."""
+        event = AgentSettledEvent()
+        await self._extension_runtime.emit_event(event)
+        return event
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
