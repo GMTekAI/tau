@@ -15,20 +15,33 @@ from tau_agent.session import CustomEntry, JsonlSessionStorage, LeafEntry, Messa
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
-from tau_coding import CodingSession, CodingSessionConfig, ResourceError, TauResourcePaths
+from tau_coding import (
+    BuiltInExtension,
+    CodingSession,
+    CodingSessionConfig,
+    ResourceError,
+    TauResourcePaths,
+)
 from tau_coding.extensions import (
     CustomMessageView,
+    DynamicProvider,
     ExtensionAPI,
     ExtensionError,
     ExtensionRuntime,
     InputEvent,
     InputHookResult,
     MessageRenderOptions,
+    NoAuth,
+    OpenAICompatibleTransport,
+    ProviderModelSnapshot,
+    ProviderRefreshContext,
+    RefreshModels,
     ToolCallHookResult,
     ToolResultHookResult,
     discover_extensions,
     load_extensions,
 )
+from tau_coding.project_trust import ProjectTrustRequest, TrustChoice
 
 pytestmark = pytest.mark.anyio
 
@@ -489,6 +502,246 @@ def test_underscore_files_are_skipped(tmp_path: Path) -> None:
     assert discovered == ()
 
 
+def _fake_built_in(
+    setup_apis: list[ExtensionAPI],
+    *,
+    refresh_models: RefreshModels | None = None,
+) -> BuiltInExtension:
+    def command(args: str, context: object) -> str:
+        del context
+        return f"built-in: {args}"
+
+    async def execute(
+        tool_call_id: str,
+        arguments: object,
+        signal: object = None,
+        on_update: object = None,
+    ) -> AgentToolResult:
+        del tool_call_id, arguments, signal, on_update
+        return AgentToolResult(content="built-in tool")
+
+    def setup(tau: ExtensionAPI) -> None:
+        setup_apis.append(tau)
+        tau.register_tool(
+            AgentTool(
+                name="fake-built-in-tool",
+                label="Fake built-in",
+                description="Exercise built-in extension loading.",
+                parameters={},
+                execute_fn=execute,
+            )
+        )
+        tau.register_command("fake-built-in", command)
+        tau.register_provider(
+            DynamicProvider(
+                id="fake-built-in-provider",
+                display_name="Fake built-in provider",
+                transport=OpenAICompatibleTransport(
+                    base_url="http://example.test/v1",
+                    auth=NoAuth(),
+                ),
+                refresh_models=refresh_models,
+            )
+        )
+
+    return BuiltInExtension(name="fake-built-in", setup=setup)
+
+
+def test_built_in_declaration_validates_name_setup_and_hidden_flag() -> None:
+    def setup(tau: ExtensionAPI) -> None:
+        del tau
+
+    async def async_setup(tau: ExtensionAPI) -> None:
+        del tau
+
+    with pytest.raises(ValueError, match="non-empty"):
+        BuiltInExtension(name="", setup=setup)
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        BuiltInExtension(name=" spaced ", setup=setup)
+    with pytest.raises(ValueError, match="sync function"):
+        BuiltInExtension(name="async", setup=async_setup)
+    with pytest.raises(ValueError, match="hidden flag"):
+        BuiltInExtension(name="visible", setup=setup, hidden=cast(bool, "yes"))
+
+
+async def test_hidden_built_in_registers_real_runtime_surfaces_despite_no_extensions(
+    tmp_path: Path,
+) -> None:
+    setup_apis: list[ExtensionAPI] = []
+    runtime = ExtensionRuntime(built_in_extensions=(_fake_built_in(setup_apis),))
+
+    runtime.load(_paths(tmp_path), include_resource_dirs=False)
+
+    assert len(setup_apis) == 1
+    assert runtime.extension_names == ()
+    assert len(runtime.extension_metadata) == 1
+    metadata = runtime.extension_metadata[0]
+    assert metadata.name == "fake-built-in"
+    assert metadata.source_id == "built-in:fake-built-in"
+    assert metadata.source == "built-in"
+    assert metadata.hidden is True
+    assert metadata.path is None
+    tool = runtime.compose_tools([])[0]
+    assert tool.name == "fake-built-in-tool"
+    assert (await tool.execute("call-1", {})).text == "built-in tool"
+    registry = runtime.build_command_registry()
+    command = registry.get("fake-built-in")
+    assert command is not None
+    result = command.handler(_command_context(registry, "/fake-built-in ok", "fake-built-in", "ok"))
+    assert result.message == "built-in: ok"
+    provider = runtime.provider_registry.effective("fake-built-in-provider")
+    assert provider is not None
+    assert provider.source_id == "built-in:fake-built-in"
+
+
+def test_built_ins_load_once_before_user_explicit_and_project_sources(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    setup_apis: list[ExtensionAPI] = []
+    _write_extension(_user_extensions_dir(paths), "user_ext", "def setup(tau):\n    pass\n")
+    explicit = _write_extension(
+        tmp_path / "explicit", "explicit_ext", "def setup(tau):\n    pass\n"
+    )
+    _write_extension(_project_extensions_dir(paths), "project_ext", "def setup(tau):\n    pass\n")
+    runtime = ExtensionRuntime(built_in_extensions=(_fake_built_in(setup_apis),))
+
+    runtime.load(paths, extra_paths=(explicit,), include_project_dir=False)
+    runtime.load(paths, include_project_dir=True, include_user_dir=False)
+
+    assert len(setup_apis) == 1
+    assert [metadata.name for metadata in runtime.extension_metadata] == [
+        "fake-built-in",
+        "user_ext",
+        "explicit_ext",
+        "project_ext",
+    ]
+    assert [metadata.source for metadata in runtime.extension_metadata] == [
+        "built-in",
+        "user",
+        "explicit",
+        "project",
+    ]
+    assert runtime.extension_names == ("user_ext", "explicit_ext", "project_ext")
+
+
+async def test_built_in_order_preserves_tool_command_and_provider_precedence(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    setup_apis: list[ExtensionAPI] = []
+    _write_extension(
+        _user_extensions_dir(paths),
+        "shadow",
+        """
+from tau_agent.tools import AgentTool, AgentToolResult
+from tau_coding.extensions import DynamicProvider, NoAuth, OpenAICompatibleTransport
+
+
+async def execute(tool_call_id, arguments, signal=None, on_update=None):
+    return AgentToolResult(content="user tool")
+
+
+def command(args, context):
+    return "user command"
+
+
+def setup(tau):
+    tau.register_tool(AgentTool(
+        name="fake-built-in-tool",
+        label="User",
+        description="User",
+        parameters={},
+        execute_fn=execute,
+    ))
+    tau.register_command("fake-built-in", command)
+    tau.register_provider(DynamicProvider(
+        id="fake-built-in-provider",
+        display_name="User provider",
+        transport=OpenAICompatibleTransport(
+            base_url="http://user.example.test/v1",
+            auth=NoAuth(),
+        ),
+    ))
+""",
+    )
+    runtime = ExtensionRuntime(built_in_extensions=(_fake_built_in(setup_apis),))
+
+    runtime.load(paths)
+
+    tool = runtime.compose_tools([])[0]
+    assert (await tool.execute("call-1", {})).text == "built-in tool"
+    registry = runtime.build_command_registry()
+    command = registry.get("fake-built-in")
+    assert command is not None
+    result = command.handler(_command_context(registry, "/fake-built-in", "fake-built-in", ""))
+    assert result.message == "built-in: "
+    provider = runtime.provider_registry.effective("fake-built-in-provider")
+    assert provider is not None
+    assert provider.source_id.startswith("extension:file:")
+    assert provider.definition.display_name == "User provider"
+
+
+def test_built_in_setup_failure_is_isolated_and_rolls_back_every_registration(
+    tmp_path: Path,
+) -> None:
+    setup_apis: list[ExtensionAPI] = []
+    working = BuiltInExtension(name="working", setup=lambda tau: None)
+    fake = _fake_built_in(setup_apis)
+
+    def broken_setup(tau: ExtensionAPI) -> None:
+        fake.setup(tau)
+        raise RuntimeError("broken declaration")
+
+    runtime = ExtensionRuntime(
+        built_in_extensions=(BuiltInExtension(name="broken", setup=broken_setup), working)
+    )
+
+    runtime.load(_paths(tmp_path), include_resource_dirs=False)
+
+    assert [metadata.name for metadata in runtime.extension_metadata] == ["working"]
+    assert runtime.extension_tools == ()
+    assert runtime.build_command_registry().get("fake-built-in") is None
+    assert runtime.provider_registry.effective("fake-built-in-provider") is None
+    assert any(
+        diagnostic.name == "broken"
+        and diagnostic.severity == "error"
+        and "built-in setup failed" in diagnostic.message
+        for diagnostic in runtime.diagnostics
+    )
+
+
+async def test_retiring_built_in_generation_cancels_provider_work_and_drops_registrations(
+    tmp_path: Path,
+) -> None:
+    setup_apis: list[ExtensionAPI] = []
+    entered = asyncio.Event()
+
+    async def refresh(context: ProviderRefreshContext) -> ProviderModelSnapshot:
+        del context
+        entered.set()
+        await asyncio.sleep(10)
+        return ProviderModelSnapshot()
+
+    runtime = ExtensionRuntime(
+        built_in_extensions=(_fake_built_in(setup_apis, refresh_models=refresh),)
+    )
+    runtime.load(_paths(tmp_path), include_resource_dirs=False)
+    registry = runtime.provider_registry
+    pending = asyncio.create_task(registry.refresh("fake-built-in-provider"))
+    await entered.wait()
+
+    runtime.retire()
+    close_result = await runtime.aclose()
+
+    assert close_result.drained is True
+    assert (await pending).status == "cancelled"
+    assert registry.effective("fake-built-in-provider") is None
+    assert runtime.extension_metadata == ()
+    assert runtime.extension_tools == ()
+    assert runtime.build_command_registry().get("fake-built-in") is None
+    with pytest.raises(ExtensionError, match="stale after reload"):
+        _ = setup_apis[0].name
+
+
 # -- runtime registration ------------------------------------------------------
 
 
@@ -569,6 +822,138 @@ def test_duplicate_tool_registration_first_wins(tmp_path: Path) -> None:
 
     assert len(runtime.extension_tools) == 1
     assert any("already registered" in diag.message for diag in runtime.diagnostics)
+
+
+@pytest.mark.parametrize("second_fails", [False, True])
+async def test_separately_loaded_same_name_sources_keep_first_tool_and_command(
+    tmp_path: Path,
+    second_fails: bool,
+) -> None:
+    paths = _paths(tmp_path)
+
+    def body(marker: str, *, fail: bool = False) -> str:
+        failure = "\n    raise RuntimeError('setup exploded')" if fail else ""
+        return f"""
+from tau_agent.tools import AgentTool, AgentToolResult
+
+
+async def _run(tool_call_id, arguments, signal=None, on_update=None):
+    return AgentToolResult(content="{marker}")
+
+
+def _command(args, context):
+    return "{marker}"
+
+
+def setup(tau):
+    tau.register_tool(AgentTool(
+        name="shared-tool",
+        label="Shared",
+        description="{marker}",
+        parameters={{}},
+        execute_fn=_run,
+    ))
+    tau.register_command("shared-command", _command){failure}
+"""
+
+    first_path = _write_extension(tmp_path / "first", "shared", body("first"))
+    second_path = _write_extension(
+        tmp_path / "second",
+        "shared",
+        body("second", fail=second_fails),
+    )
+    runtime = ExtensionRuntime()
+
+    runtime.load(paths, extra_paths=(first_path,), include_resource_dirs=False)
+    runtime.load(paths, extra_paths=(second_path,), include_resource_dirs=False)
+
+    tool = runtime.compose_tools([])[0]
+    assert tool.description == "first"
+    assert (await tool.execute("call-1", {})).text == "first"
+    registry = runtime.build_command_registry()
+    command = registry.get("shared-command")
+    assert command is not None
+    result = command.handler(_command_context(registry, "/shared-command", "shared-command", ""))
+    assert result.message == "first"
+    assert any("already registered" in diag.message for diag in runtime.diagnostics)
+
+
+async def test_failed_setup_cleans_every_registration_after_entry_symlink_retarget(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    target_a = tmp_path / "target-a.py"
+    target_b = tmp_path / "target-b.py"
+    entry = tmp_path / "shared.py"
+    handler_marker = tmp_path / "orphan-handler-ran"
+    target_a.write_text(
+        f"""
+from pathlib import Path
+
+from tau_agent.tools import AgentTool, AgentToolResult
+from tau_coding.extensions import DynamicProvider, NoAuth, OpenAICompatibleTransport
+
+
+async def _tool(tool_call_id, arguments, signal=None, on_update=None):
+    return AgentToolResult(content="orphan")
+
+
+def _command(args, context):
+    return "orphan"
+
+
+def _handler(event, context):
+    Path({str(handler_marker)!r}).write_text("ran", encoding="utf-8")
+
+
+def _renderer(message, options):
+    return "orphan"
+
+
+def setup(tau):
+    tau.register_provider(DynamicProvider(
+        id="orphan-provider",
+        display_name="Orphan",
+        transport=OpenAICompatibleTransport(
+            base_url="http://example.test/v1",
+            auth=NoAuth(),
+        ),
+    ))
+    tau.register_tool(AgentTool(
+        name="orphan-tool",
+        label="Orphan",
+        description="Orphan",
+        parameters={{}},
+        execute_fn=_tool,
+    ))
+    tau.register_command("orphan-command", _command)
+    tau.add_prompt_guideline("orphan guideline")
+    tau.register_message_renderer("orphan:message", _renderer)
+    tau.on("input", _handler)
+    entry = Path({str(entry)!r})
+    entry.unlink()
+    entry.symlink_to(Path({str(target_b)!r}))
+    raise RuntimeError("setup exploded")
+""",
+        encoding="utf-8",
+    )
+    target_b.write_text("def setup(tau):\n    pass\n", encoding="utf-8")
+    entry.symlink_to(target_a)
+    runtime = ExtensionRuntime()
+
+    runtime.load(paths, extra_paths=(entry,), include_resource_dirs=False)
+
+    assert entry.resolve() == target_b
+    assert runtime.extension_names == ()
+    assert runtime.provider_registry.effective("orphan-provider") is None
+    assert runtime.extension_tools == ()
+    assert runtime.build_command_registry().get("orphan-command") is None
+    assert runtime.prompt_guidelines == ()
+    assert runtime.render_custom_message("orphan:message", "content", None, False) is None
+    outcome = await runtime.run_input_hooks("unchanged")
+    assert outcome.text == "unchanged"
+    assert not handler_marker.exists()
+    assert any("setup failed" in diagnostic.message for diagnostic in runtime.diagnostics)
 
 
 def test_extension_commands_layer_onto_default_registry(tmp_path: Path) -> None:
@@ -1506,7 +1891,12 @@ def _register_inline_extension(runtime: ExtensionRuntime, name: str) -> object:
         captured["api"] = api
 
     runtime._setup_extension(  # noqa: SLF001 - test seam
-        LoadedExtension(name=name, path=Path(f"/virtual/{name}.py"), setup=setup)
+        LoadedExtension(
+            name=name,
+            path=Path(f"/virtual/{name}.py"),
+            source_id=f"extension:test:{name}",
+            setup=setup,
+        )
     )
     return captured["api"]
 
@@ -1541,6 +1931,104 @@ def _session_config(
         cwd=paths.cwd,
         resource_paths=paths,
     )
+
+
+async def test_session_loads_built_in_without_extension_discovery_or_project_trust_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace as dataclass_replace
+
+    import tau_coding.built_in_extensions as declarations
+
+    setup_apis: list[ExtensionAPI] = []
+    monkeypatch.setattr(
+        declarations,
+        "BUILT_IN_EXTENSIONS",
+        (_fake_built_in(setup_apis),),
+    )
+    prompt_calls = 0
+
+    async def prompt(request: ProjectTrustRequest) -> TrustChoice:
+        nonlocal prompt_calls
+        del request
+        prompt_calls += 1
+        return "decline_once"
+
+    config = dataclass_replace(
+        _session_config(
+            tmp_path,
+            FakeProvider([]),
+            extension_body=(
+                "def setup(tau):\n    tau.add_prompt_guideline('user should not load')\n"
+            ),
+        ),
+        extensions_enabled=False,
+        trust_interactive=True,
+        trust_prompt=prompt,
+    )
+
+    session = await CodingSession.load(config)
+
+    assert prompt_calls == 0
+    assert session.project_trust_resolution is not None
+    assert session.project_trust_resolution.source == "empty"
+    assert "fake-built-in-tool" in [tool.name for tool in session.tools]
+    assert "user should not load" not in session.extension_runtime.prompt_guidelines
+    assert session.extension_names == ()
+    assert session.extension_runtime.extension_metadata[0].source == "built-in"
+    await session.aclose()
+
+
+@pytest.mark.parametrize("operation", ["reload", "new", "resume"])
+async def test_session_lifecycle_recreates_built_in_in_a_fresh_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    from dataclasses import replace as dataclass_replace
+
+    import tau_coding.built_in_extensions as declarations
+    from tau_coding import SessionManager, TauPaths
+
+    setup_apis: list[ExtensionAPI] = []
+    monkeypatch.setattr(
+        declarations,
+        "BUILT_IN_EXTENSIONS",
+        (_fake_built_in(setup_apis),),
+    )
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "home-tau", agents_home=tmp_path / "home-agents")
+    )
+    config = _session_config(tmp_path, FakeProvider([]))
+    initial = manager.create_session(cwd=config.cwd, model="fake")
+    destination = manager.create_session(cwd=config.cwd, model="fake")
+    config = dataclass_replace(
+        config,
+        extensions_enabled=False,
+        session_manager=manager,
+        session_id=initial.id,
+    )
+    session = await CodingSession.load(config)
+    old_runtime = session.extension_runtime
+    old_generation = old_runtime.provider_registry.generation_id
+    old_api = setup_apis[0]
+
+    if operation == "reload":
+        await session.reload()
+    elif operation == "resume":
+        await session.resume(destination.id)
+    else:
+        await session.new_session()
+
+    assert len(setup_apis) == 2
+    assert session.extension_runtime is not old_runtime
+    assert session.extension_runtime.provider_registry.generation_id != old_generation
+    assert old_runtime.active is False
+    assert session.extension_runtime.extension_metadata[0].source_id == "built-in:fake-built-in"
+    with pytest.raises(ExtensionError, match="stale after reload"):
+        _ = old_api.name
+    await session.aclose()
 
 
 async def test_session_exposes_extension_tools_and_commands(tmp_path: Path) -> None:
@@ -1856,6 +2344,234 @@ async def test_reload_picks_up_new_extension(tmp_path: Path) -> None:
     assert summary.extensions.after == 1
     assert "hello" in [tool.name for tool in session.tools]
     assert "hello" in session.system_prompt
+
+
+@pytest.mark.parametrize("operation", ["reload", "replacement", "final_close"])
+async def test_session_lifecycle_awaits_outgoing_provider_cleanup(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    from dataclasses import replace as dataclass_replace
+
+    from tau_coding import SessionManager, TauPaths
+
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "home-tau", agents_home=tmp_path / "home-agents")
+    )
+    config = _session_config(tmp_path, FakeProvider([]))
+    record = manager.create_session(cwd=config.cwd, model="fake")
+    config = dataclass_replace(config, session_manager=manager, session_id=record.id)
+    session = await CodingSession.load(config)
+    old_runtime = session.extension_runtime
+    old_registry = old_runtime.provider_registry
+    entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_cancelled = False
+
+    async def refresh(context):
+        nonlocal cleanup_cancelled
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+                raise
+
+    old_registry.register(
+        "test-source",
+        DynamicProvider(
+            id="local",
+            display_name="Local",
+            transport=OpenAICompatibleTransport(
+                base_url="http://example.test/v1",
+                auth=NoAuth(),
+            ),
+            refresh_models=refresh,
+        ),
+    )
+    pending = asyncio.create_task(old_registry.refresh("local"))
+    await entered.wait()
+
+    if operation == "final_close":
+        old_runtime.retire()
+        lifecycle = asyncio.create_task(session.aclose())
+    elif operation == "replacement":
+        lifecycle = asyncio.create_task(session.new_session())
+    else:
+        lifecycle = asyncio.create_task(session.reload())
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+    await asyncio.sleep(0.15)
+
+    assert lifecycle.done() is False
+    assert cleanup_cancelled is False
+    release_cleanup.set()
+    await asyncio.wait_for(lifecycle, timeout=1.0)
+    assert (await pending).status == "cancelled"
+    assert not old_registry._discovery_tasks  # type: ignore[attr-defined]
+
+    if operation != "final_close":
+        await session.aclose()
+
+
+@pytest.mark.parametrize("operation", ["reload", "new", "resume"])
+async def test_published_lifecycle_adoption_contains_cancellation_during_outgoing_close(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    from dataclasses import replace as dataclass_replace
+
+    from tau_coding import SessionManager, TauPaths
+
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "home-tau", agents_home=tmp_path / "home-agents")
+    )
+    config = _session_config(tmp_path, FakeProvider([]))
+    record = manager.create_session(cwd=config.cwd, model="fake")
+    resume_record = manager.create_session(cwd=config.cwd, model="fake")
+    config = dataclass_replace(config, session_manager=manager, session_id=record.id)
+    session = await CodingSession.load(config)
+    old_runtime = session.extension_runtime
+    old_registry = old_runtime.provider_registry
+    entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_recancelled = False
+
+    async def refresh(context):
+        nonlocal cleanup_recancelled
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                cleanup_recancelled = True
+                raise
+
+    old_registry.register(
+        "test-source",
+        DynamicProvider(
+            id="local",
+            display_name="Local",
+            transport=OpenAICompatibleTransport(
+                base_url="http://example.test/v1",
+                auth=NoAuth(),
+            ),
+            refresh_models=refresh,
+        ),
+    )
+    pending = asyncio.create_task(old_registry.refresh("local"))
+    await entered.wait()
+
+    if operation == "reload":
+        lifecycle = asyncio.create_task(session.reload())
+    elif operation == "resume":
+        lifecycle = asyncio.create_task(session.resume(resume_record.id))
+    else:
+        lifecycle = asyncio.create_task(session.new_session())
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+    assert session.extension_runtime is not old_runtime
+    assert old_runtime.active is False
+
+    assert lifecycle.cancel() is True
+    await asyncio.sleep(0)
+    assert lifecycle.done() is False
+    release_cleanup.set()
+    result = await asyncio.wait_for(lifecycle, timeout=1.0)
+
+    assert result is not None
+    assert lifecycle.cancelled() is False
+    assert cleanup_recancelled is False
+    assert (await pending).status == "cancelled"
+    assert not old_registry._discovery_tasks  # type: ignore[attr-defined]
+    if operation == "resume":
+        assert session.session_id == resume_record.id
+    await session.aclose()
+
+
+async def test_final_close_finishes_registry_and_each_provider_before_propagating_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await CodingSession.load(_session_config(tmp_path, FakeProvider([])))
+    runtime = session.extension_runtime
+    registry = runtime.provider_registry
+    entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    runtime_close_calls = 0
+
+    async def refresh(context):
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+    registry.register(
+        "test-source",
+        DynamicProvider(
+            id="local",
+            display_name="Local",
+            transport=OpenAICompatibleTransport(
+                base_url="http://example.test/v1",
+                auth=NoAuth(),
+            ),
+            refresh_models=refresh,
+        ),
+    )
+    pending = asyncio.create_task(registry.refresh("local"))
+    await entered.wait()
+
+    original_runtime_close = runtime.aclose
+
+    async def counted_runtime_close():
+        nonlocal runtime_close_calls
+        runtime_close_calls += 1
+        return await original_runtime_close()
+
+    monkeypatch.setattr(runtime, "aclose", counted_runtime_close)
+
+    class CountingProvider:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+
+    providers = (CountingProvider(), CountingProvider())
+    session._owned_providers.extend(providers)  # type: ignore[arg-type]  # noqa: SLF001
+
+    close = asyncio.create_task(session.aclose())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+    assert close.cancel() is True
+    await asyncio.sleep(0)
+    assert close.done() is False
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(close, timeout=1.0)
+
+    assert (await pending).status == "cancelled"
+    assert runtime_close_calls == 1
+    assert [provider.close_calls for provider in providers] == [1, 1]
+    assert session._owned_providers == []  # noqa: SLF001
+    assert not registry._discovery_tasks  # type: ignore[attr-defined]
+
+    await session.aclose()
+    assert runtime_close_calls == 1
+    assert [provider.close_calls for provider in providers] == [1, 1]
 
 
 async def test_runtime_survives_new_session_swap(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from collections.abc import Sequence
 from os import environ
 from pathlib import Path
 from typing import Annotated, Literal
@@ -31,6 +32,7 @@ from tau_coding.provider_config import (
     CredentialReader,
     OpenAICompatibleProviderConfig,
     ProviderConfig,
+    ProviderConfigError,
     ProviderSettings,
     load_provider_settings,
     provider_kind,
@@ -39,7 +41,7 @@ from tau_coding.provider_config import (
     save_provider_settings,
     upsert_openai_compatible_provider,
 )
-from tau_coding.provider_runtime import create_model_provider
+from tau_coding.provider_runtime import ClosableModelProvider, create_model_provider
 from tau_coding.rendering import PrintOutputMode, create_event_renderer
 from tau_coding.resources import TauResourcePaths
 from tau_coding.rpc import RpcServer
@@ -56,6 +58,7 @@ from tau_coding.session_export import (
     normalize_export_format,
 )
 from tau_coding.session_manager import CodingSessionRecord, SessionManager, validate_session_id
+from tau_coding.session_preparation import prepare_coding_session
 from tau_coding.shell_config import load_shell_settings
 from tau_coding.tui import run_tui_app
 from tau_coding.update_check import (
@@ -966,52 +969,101 @@ async def run_openai_print_mode(
         session_id=session_id,
     )
     explicit_selection = provider_name is not None or model is not None
-    selection = resolve_provider_selection(
-        settings,
-        provider_name=provider_name if explicit_selection else record.provider_name,
-        model=model if explicit_selection else record.model,
+    selection = None
+    if not explicit_selection and record.provider_name is None:
+        selection = resolve_provider_selection(settings)
+    elif not explicit_selection and record.provider_name is not None:
+        try:
+            selection = resolve_provider_selection(
+                settings,
+                provider_name=record.provider_name,
+                model=record.model,
+            )
+        except ProviderConfigError:
+            selection = None
+    selected_model = model or record.model or (selection.model if selection is not None else "")
+    selected_provider: str = (
+        provider_name
+        if provider_name is not None
+        else record.provider_name
+        or (selection.provider.name if selection is not None else DEFAULT_PROVIDER_NAME)
     )
-    inference_provider = (
-        record.inference_provider
-        if resume_session_id is not None
-        and record.provider_name == "huggingface"
-        and selection.provider.name == "huggingface"
-        and record.model == selection.model
-        else selection.provider.inference_providers.get(selection.model)
-        if isinstance(selection.provider, OpenAICompatibleProviderConfig)
-        and selection.provider.name == "huggingface"
-        else None
+    # Durable providers retain the established print-mode construction seam.
+    # Dynamic providers are absent from ProviderSettings and therefore remain
+    # None until CodingSession's trusted staged environment resolves them.
+    static_selection = selection
+    if static_selection is None:
+        try:
+            static_selection = resolve_provider_selection(
+                settings,
+                provider_name=selected_provider,
+                model=selected_model or None,
+            )
+        except ProviderConfigError:
+            static_selection = None
+    initial_provider: ClosableModelProvider | None = None
+    runtime_config: ProviderConfig | None = None
+    runtime_inference = record.inference_provider
+    runtime_inference_mode: Literal["automatic", "fixed"] = (
+        record.inference_provider_mode or "automatic"
     )
-    inference_provider_mode = (
-        record.inference_provider_mode
-        if resume_session_id is not None
-        and record.provider_name == "huggingface"
-        and selection.provider.name == "huggingface"
-        and record.model == selection.model
-        else "fixed"
-        if inference_provider is not None
-        else "automatic"
-    )
-    provider = create_model_provider(
-        selection.provider,
-        model=selection.model,
-        inference_provider=inference_provider,
-        thinking_level=resolve_startup_thinking_level(selection.provider, selection.model),
-    )
+    if static_selection is not None:
+        runtime_inference = (
+            record.inference_provider
+            if (
+                resume_session_id is not None
+                and record.provider_name == "huggingface"
+                and static_selection.provider.name == "huggingface"
+                and record.model == static_selection.model
+            )
+            else (
+                static_selection.provider.inference_providers.get(static_selection.model)
+                if isinstance(static_selection.provider, OpenAICompatibleProviderConfig)
+                and static_selection.provider.name == "huggingface"
+                else None
+            )
+        )
+        runtime_inference_mode = (
+            record.inference_provider_mode
+            if (
+                resume_session_id is not None
+                and record.provider_name == "huggingface"
+                and static_selection.provider.name == "huggingface"
+                and record.model == static_selection.model
+            )
+            else "fixed"
+            if runtime_inference is not None
+            else "automatic"
+        )
+        initial_provider = create_model_provider(
+            static_selection.provider,
+            model=static_selection.model,
+            inference_provider=runtime_inference,
+            thinking_level=resolve_startup_thinking_level(
+                static_selection.provider,
+                static_selection.model,
+            ),
+        )
+        selected_provider = static_selection.provider.name
+        selected_model = static_selection.model
+        runtime_config = static_selection.provider
     try:
         return await run_print_mode(
             prompt=prompt,
-            model=selection.model,
+            model=selected_model,
             cwd=record.cwd,
-            provider=provider,
+            provider=initial_provider,
             output=output,
             storage=jsonl_session_storage(record.path),
             session_id=record.id,
             session_manager=manager,
-            provider_name=selection.provider.name,
-            inference_provider=inference_provider,
+            provider_name=selected_provider,
+            inference_provider=runtime_inference,
             provider_settings=settings,
-            runtime_provider_config=selection.provider,
+            runtime_provider_config=runtime_config,
+            requested_provider=provider_name if explicit_selection else None,
+            requested_model=model if explicit_selection else None,
+            session_provider_name=record.provider_name,
             shell_command_prefix=shell_settings.shell_command_prefix,
             extension_paths=extension_paths,
             extensions_enabled=extensions_enabled,
@@ -1020,11 +1072,15 @@ async def run_openai_print_mode(
             append_system_prompt=append_system_prompt,
             trust_override=trust_override,
             trust_default=shell_settings.default_project_trust,
-            startup_model_override=provider_name is not None or model is not None,
-            inference_provider_mode=inference_provider_mode,
+            startup_model_override=False,
+            inference_provider_mode=runtime_inference_mode,
         )
     finally:
-        await provider.aclose()
+        # This remains the ownership path for the compatibility provider
+        # constructed by this legacy wrapper. Dynamic candidates are created
+        # and owned inside the staged CodingSession instead.
+        if initial_provider is not None:
+            await initial_provider.aclose()
 
 
 def _print_session_record(
@@ -1044,7 +1100,18 @@ def _print_session_record(
             raise ValueError(f"Unknown session: {resume_session_id}")
         return record
 
-    selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
+    try:
+        selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
+    except ProviderConfigError:
+        if provider_name is None or model is None:
+            raise
+        return _create_print_session(
+            manager,
+            cwd=cwd,
+            model=model,
+            provider_name=provider_name,
+            session_id=session_id,
+        )
     inference_provider = (
         selection.provider.inference_providers.get(selection.model)
         if isinstance(selection.provider, OpenAICompatibleProviderConfig)
@@ -1085,7 +1152,7 @@ async def run_print_mode(
     prompt: str,
     model: str,
     cwd: Path,
-    provider: ModelProvider,
+    provider: ModelProvider | None,
     output: PrintOutputMode = PrintOutputMode.text,
     resource_paths: TauResourcePaths | None = None,
     storage: SessionStorage | None = None,
@@ -1096,6 +1163,9 @@ async def run_print_mode(
     inference_provider_mode: Literal["automatic", "fixed"] | None = None,
     provider_settings: ProviderSettings | None = None,
     runtime_provider_config: ProviderConfig | None = None,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+    session_provider_name: str | None = None,
     shell_command_prefix: str | None = None,
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
@@ -1111,7 +1181,7 @@ async def run_print_mode(
     Returns False when the agent emits a non-recoverable error so CLI callers
     can fail non-interactive runs while still rendering the error message.
     """
-    session = await CodingSession.load(
+    prepared = await prepare_coding_session(
         CodingSessionConfig(
             provider=provider,
             model=model,
@@ -1125,6 +1195,9 @@ async def run_print_mode(
             inference_provider_mode=inference_provider_mode,
             provider_settings=provider_settings,
             runtime_provider_config=runtime_provider_config,
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            session_provider_name=session_provider_name,
             shell_command_prefix=shell_command_prefix,
             extension_paths=extension_paths,
             extensions_enabled=extensions_enabled,
@@ -1133,8 +1206,18 @@ async def run_print_mode(
             append_system_prompt=append_system_prompt,
             trust_override=trust_override,
             trust_default=trust_default,
-        )
+        ),
+        session_loader=CodingSession,
     )
+    # Informational print commands must not publish the staged initial
+    # transcript; /system explicitly promises not to save anything.
+    if (stripped_prompt := prompt.strip()) == "/system" or stripped_prompt.startswith("/system "):
+        command = prepared.session.handle_command(prompt)
+        await prepared.abort()
+        if command.message:
+            typer.echo(command.message)
+        return True
+    session = await prepared.adopt()
     if startup_model_override:
         await session.apply_startup_model_override(model)
     session.extension_runtime.set_ui_bridge(StderrUiBridge())
@@ -1158,6 +1241,11 @@ async def run_print_mode(
         command = session.handle_command(prompt)
         if command.handled:
             message = command.message
+            if command.local_requested:
+                message = (
+                    "The /local command is interactive-only. In print mode, configure a "
+                    "backend in the TUI, then use --provider and --model."
+                )
             if command.reload_requested:
                 try:
                     summary = await session.reload()
@@ -1183,6 +1271,9 @@ class _MemorySessionStorage:
 
     async def append(self, entry: SessionEntry) -> None:
         self.entries.append(entry)
+
+    async def append_batch(self, entries: Sequence[SessionEntry]) -> None:
+        self.entries.extend(entries)
 
     async def read_all(self) -> list[SessionEntry]:
         return list(self.entries)

@@ -3,10 +3,10 @@ title: Extensions
 description: Extend Tau with plain Python — custom tools, slash commands, hooks, dialogs, and message rendering.
 ---
 
-Extensions are Python modules that customize a Tau session: they add tools
-and slash commands, observe the agent event stream, and intercept tool
-calls, tool results, and user input. The design follows Pi's extension
-system, adapted to Python.
+Extensions are Python modules that customize a Tau session: they add tools,
+slash commands, and process-local provider definitions; observe the agent event
+stream; and intercept tool calls, tool results, and user input. The design
+follows Pi's extension system, adapted to Python.
 
 ## Quick start
 
@@ -86,6 +86,29 @@ with your user permissions, so review the source before installation.
 | `<project>/.tau/extensions/` | only after project approval **and** `--project-extensions` |
 | any file or directory | with `tau -e PATH` (repeatable) |
 
+### Trusted built-in extensions
+
+Tau may bundle product capabilities as `BuiltInExtension` declarations. A
+built-in is not a special provider or command branch: its synchronous
+`setup(tau)` receives the normal extension API and registers tools, commands,
+process-local providers, hooks, or later extension capabilities through the
+same runtime.
+
+Built-ins load once per staged runtime, before user, explicit, and trusted
+project sources. They still load with `--no-extensions`, because that flag turns
+off filesystem discovery rather than capabilities shipped in Tau itself. Their
+code is trusted as installed package code and never counts as ambient project
+input, so a built-in alone cannot trigger project trust.
+
+Declarations are hidden by default. Hidden means omitted from ordinary
+extension-name counts, not inactive: detailed runtime metadata retains the
+`built-in` source, stable `built-in:<name>` source ID, and hidden flag. Setup
+exceptions are isolated diagnostics and all partial registrations from that
+source are removed. Reload, resume, new-session, and cwd replacement use fresh
+generations; retiring an old generation invalidates captured APIs, removes its
+registrations, and cancels generation-owned provider refresh work. Generic core
+loading never checks a built-in capability's name.
+
 Within a directory, `*.py` files are extensions, and a subdirectory
 containing `extension.py` is a package-style extension — its sibling
 modules are imported with relative imports (`from . import helper`).
@@ -119,9 +142,10 @@ first decisive result wins, errors safely defer, and remembered results save
 only the exact cwd before project loading. Project extensions cannot approve
 themselves.
 
-Extensions load project-first after approval; on name conflicts (extension names, tool
-names, command names) the first registration wins. `--no-extensions`
-disables directory discovery entirely (explicit `-e` paths still load).
+After built-ins, filesystem extensions keep their existing precedence; on name
+conflicts (extension names, tool names, command names) the first registration
+wins. `--no-extensions` disables directory discovery (explicit `-e` paths and
+trusted built-ins still load).
 `/reload` awaits `session_shutdown(reason="reload")` on the outgoing
 extension generation, clears its UI, re-imports every extension and re-runs
 `setup`, then awaits `session_start(reason="reload")` on the new generation.
@@ -138,6 +162,7 @@ Use those lifecycle hooks to stop and restart background work and to remount UI.
 def setup(tau):
     # registration
     tau.register_tool(agent_tool)            # tau_agent.tools.AgentTool
+    tau.register_provider(dynamic_provider)  # process-local
     tau.register_command("name", handler, description="...")
     tau.add_prompt_guideline("Never commit directly to main")
     tau.on("event_name", handler)            # or @tau.on("event_name")
@@ -185,6 +210,91 @@ reject the operation. The current resolved route is available as
 or async and always receive `(event, context)`; the context is freshly created
 for each dispatch. Action methods raise `ExtensionError` if called before the session
 is bound — register handlers in `setup` and act on events instead.
+
+### Local-backend registrations
+
+An extension can pair a provider layer with a provider-neutral local backend:
+
+```python
+def setup(tau):
+    tau.register_provider(provider)
+    tau.register_local_backend(backend)
+```
+
+A backend declares structured text, secret, and choice fields plus asynchronous
+configuration, refresh, status, and optional doctor/reset/model-management
+operations. The host renders the values and owns confirmation, cancellation, and
+idle checks; backend code never receives Textual widgets. Configuration is one
+transaction, so validation or safe-state failure does not replace the prior
+configuration. Secrets stay out of representations and host diagnostics.
+
+The backend and provider must be registered by the same source and generation.
+If another source shadows the provider, the backend can remain inspectable but
+cannot use, reset, or manage models through the shadowed layer. Retired or
+reloaded generations cancel their backend work and ignore late results. See the
+[local backends guide]({{< relref "./local-inference.md" >}}).
+
+### Dynamic providers
+
+`register_provider` installs a complete `DynamicProvider` layer owned by the
+calling extension source and current runtime generation. A provider may start
+dormant with no models, and supplies exactly one runtime mechanism: an
+`OpenAICompatibleTransport` descriptor or a custom runtime factory. Use
+`ProviderModel` values for known metadata; leave unknown fields as `None`.
+
+Authentication is explicit: `RequiredApiKey`, `OptionalApiKey`, or `NoAuth`.
+Stored credentials win over the configured environment variable. Optional or
+absent keys omit `Authorization`; Tau never synthesizes a local key. Static
+transport/model headers cannot provide `Authorization`; custom schemes must be
+resolved by an auth strategy at runtime. Resolved keys, headers, and arbitrary
+auth provenance stay out of provider representations and diagnostics. Runtime
+creation replaces custom auth exceptions with a categorical host error; Tau's exact
+required-key strategy still reports its actionable missing-credential guidance.
+Nested JSON compatibility metadata is deeply frozen while registered and copied to ordinary
+JSON containers only when a runtime transport is created.
+
+Discovery is snapshot-oriented. A `refresh_models` callback returns a complete
+`ProviderModelSnapshot`; the registry validates and publishes it atomically.
+Concurrent callers share work only when their layer and `allow_network` policy
+match, and each caller keeps its own timeout. Opposite network policies never
+alias. The last timeout and explicit cancellation leave the coalescing table before
+returning, so an immediate retry invokes fresh discovery. Tau requests task
+cancellation once, then waits up to 0.25 seconds from that request without
+re-cancelling a callback's `finally` cleanup. Reload, session replacement, and final
+close await this cooperative drain. Once reload/replacement publishes its new state,
+caller cancellation is contained until outgoing cleanup finishes and the operation
+returns the adopted result; it never reports cancellation as though publication
+rolled back. Before publication, the replacement remains the explicit owner of its
+candidate providers. Cancellation or failure during outgoing shutdown or incoming
+start closes those candidates exactly once without closing the active provider;
+success transfers ownership once. Final close uses one durable close task and
+propagates cancellation only after the extension registry and every session-owned
+runtime provider have each been closed once. A callback still running at the bound is reported as contained—not
+drained—and a process-owned supervisor keeps its task and generation registry
+reachable until it actually finishes; it cannot publish after source replacement or
+retirement. Timeout, malformed output, and other failures retain the current
+snapshot.
+
+Dynamic definitions are runtime overlays—not durable configuration. Tau never
+copies them into `catalog.toml`, `providers.json`, sessions, or generic extension
+storage. Provider source ownership comes from the canonical entry path assigned by
+the host, not the display name. The loader freezes all discovered source IDs before
+importing any extension, so import/setup code cannot change ownership by retargeting
+an entry or parent symlink. The stored ID is used for duplicate checks, every API
+registration, and complete failed-setup cleanup. Separately loaded same-name
+extensions therefore form independent provider layers; repeating the exact entry
+source in one runtime is ignored with first-loaded precedence. Tools and commands
+still use their first-registration-wins name registries. Removing a source reveals
+the preceding complete layer, including the exact durable provider baseline. The contracts are
+frontend-free and callbacks must not return Rich/Textual values.
+
+Phase 6 validates these contracts with a permanent second fake backend and a
+small test-only Ollama adapter. The trusted built-in `llama.cpp` provider uses
+the same seams; no production Ollama backend is shipped. Provider discovery and
+backend status may use different protocol endpoints, and `NoAuth` is a first-
+class option. Its connection, cache, and troubleshooting behavior are covered
+in the [local inference guide]({{< relref "./local-inference.md" >}}). Router
+management and Hugging Face model mutations remain outside this phase.
 
 ### Tools
 
@@ -624,7 +734,7 @@ tau -e ./tau-subagents
 
 Compared to Pi's extension system, Tau does not yet include a complete package
 manager (the installer has no registry, dependency installation, remove, or
-package-update commands), custom providers, custom entry renderers (non-context
-cards), declarative keyboard-shortcut registration, CLI flag registration,
+package-update commands), custom entry renderers (non-context cards),
+declarative keyboard-shortcut registration, CLI flag registration,
 system-prompt replacement, or context rewriting. The architecture document
 (`dev-notes/architecture/phase-21-extensions.md`) tracks the extension design.

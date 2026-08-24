@@ -54,6 +54,19 @@ from tau_coding.events import (
     QueueUpdateEvent,
     SessionAgentEndEvent,
 )
+from tau_coding.extensions import (
+    DynamicProvider,
+    DynamicProviderRegistry,
+    LocalBackend,
+    LocalBackendRegistry,
+    LocalBackendStatus,
+    LocalConfigureResult,
+    LocalConfigureSpec,
+    LocalModel,
+    NoAuth,
+    OpenAICompatibleTransport,
+    ProviderModel,
+)
 from tau_coding.paths import TauPaths
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_config import (
@@ -121,6 +134,7 @@ from tau_coding.tui.config import (
     TuiTheme,
     tui_settings_path,
 )
+from tau_coding.tui.local_backends import LocalBackendScreen, LocalConfirmScreen
 from tau_coding.tui.state import ChatItem, TuiState
 from tau_coding.tui.terminal_notification import TerminalNotificationController
 from tau_coding.tui.terminal_title import TerminalTitleController
@@ -854,6 +868,20 @@ def test_compact_session_info_renders_sidebar_facts() -> None:
     assert "openai:fake-model" in lines[provider_line]
     assert "(medium)" in lines[provider_line]
     assert context_line == provider_line + 1
+
+
+def test_compact_session_info_omits_unavailable_thinking_controls() -> None:
+    console = Console(record=True, width=120)
+    session = FakeSession()
+    session.available_thinking_levels = ()
+
+    console.print(render_compact_session_info(session))
+
+    provider_line = next(
+        line for line in console.export_text().splitlines() if "openai:fake-model" in line
+    )
+    assert "unavailable" not in provider_line
+    assert "fake-model (" not in provider_line
 
 
 def test_compact_session_info_shows_unknown_without_provider_usage() -> None:
@@ -4117,6 +4145,98 @@ async def test_extension_confirm_dialog_yes_and_cancel() -> None:
         await pilot.pause()
         await pilot.press("escape")
         assert await cancel_task is False
+
+
+@pytest.mark.anyio
+async def test_local_modals_receive_app_level_arrow_navigation() -> None:
+    providers = DynamicProviderRegistry(generation_id="local-navigation")
+    providers.register(
+        "source",
+        DynamicProvider(
+            id="local-provider",
+            display_name="Local provider",
+            models=(ProviderModel("first"), ProviderModel("second")),
+            default_model="first",
+            transport=OpenAICompatibleTransport(
+                base_url="http://example.test/v1",
+                auth=NoAuth(),
+            ),
+        ),
+    )
+    registry = LocalBackendRegistry(providers, generation_id="local-navigation")
+
+    async def status(context):
+        del context
+        return LocalBackendStatus(
+            state="ready",
+            models=(
+                LocalModel("first", state="unloaded"),
+                LocalModel("second", state="unloaded"),
+            ),
+            actions=("configure", "refresh"),
+        )
+
+    registry.register(
+        "source",
+        LocalBackend(
+            id="local",
+            provider_id="local-provider",
+            display_name="Local",
+            configure_spec=LocalConfigureSpec(),
+            configure=lambda values, context: LocalConfigureResult(committed=True),
+            status=status,
+            refresh=status,
+        ),
+    )
+    app = TauTuiApp(FakeSession())  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.session.extension_runtime = SimpleNamespace(local_backend_registry=registry)
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.focus()
+        app._open_local_backend_picker()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, LocalBackendScreen)
+        assert len(app.screen_stack) == 2
+        model_list = app.screen.query_one("#local-model-list", ListView)
+        action_menu = app.screen.query_one("#local-action-menu", ListView)
+        assert model_list.has_focus
+        assert model_list.index == 0
+        assert action_menu.index == 0
+        await pilot.press("down")
+        assert model_list.index == 1
+        await pilot.press("up")
+        assert model_list.index == 0
+        await pilot.press("down", "down")
+        assert action_menu.has_focus
+        assert action_menu.index == 0
+        await pilot.press("up")
+        assert model_list.has_focus
+        assert model_list.index == 1
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        assert app.focused is prompt
+        await pilot.press("x")
+        assert prompt.text == "x"
+
+        selected: list[bool | None] = []
+        app.push_screen(
+            LocalConfirmScreen("Load model?", "This is expensive.", theme=TAU_DARK_THEME),
+            callback=selected.append,
+        )
+        await pilot.pause()
+        choices = app.screen.query_one("#local-confirm-list", ListView)
+        assert choices.index == 1  # No is the safe default.
+        await pilot.press("up")
+        await pilot.press("enter")
+        assert selected == [True]
+
+    await registry.aclose()
 
 
 @pytest.mark.anyio
@@ -8665,16 +8785,20 @@ async def test_run_tui_app_falls_back_to_first_credentialed_provider(
         def get_session(self, session_id: str) -> CodingSessionRecord | None:
             return None
 
+    class LoadedSession:
+        async def aclose(self) -> None:
+            calls.append("session_closed")
+
     class FakeCodingSession:
         @classmethod
-        async def load(cls, config: object) -> str:
+        async def load(cls, config: object) -> LoadedSession:
             assert config.provider_name == "openai"  # type: ignore[attr-defined]
             calls.append("load")
-            return "session"
+            return LoadedSession()
 
     class FakeApp:
-        def __init__(self, session: str, **kwargs: object) -> None:
-            assert session == "session"
+        def __init__(self, session: LoadedSession, **kwargs: object) -> None:
+            assert isinstance(session, LoadedSession)
             assert kwargs["startup_message"] is None
 
         async def run_async(self) -> None:
@@ -8719,6 +8843,7 @@ async def test_run_tui_app_falls_back_to_first_credentialed_provider(
         f"prepare:{tmp_path}:gpt-5.5:openai",
         "load",
         "run",
+        "session_closed",
         "provider_closed",
     ]
 

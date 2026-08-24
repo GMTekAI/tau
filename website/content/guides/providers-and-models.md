@@ -307,6 +307,34 @@ Use `/login anthropic-api` or `/login anthropic-subscription`, then select
 [Claude Opus 5 guide](https://platform.claude.com/docs/en/about-claude/models/whats-new-opus-5)
 for current behavior and availability.
 
+## Dynamic extension providers
+
+Tau's extension API has a process-local `DynamicProvider` contract validated
+by a permanent second fake backend and a test-only Ollama adapter. Unlike
+providers created by `/login custom` or `tau setup`, these definitions are
+source/generation-owned overlays and are never copied into `catalog.toml`,
+`providers.json`, sessions, or generic disk storage. Source ownership is a stable
+host identity derived from the canonical extension entry path—not the display
+name. Tau freezes every discovered identity before importing extension code, so
+symlink retargeting cannot change registration or cleanup ownership; separate
+same-name extension files cannot remove one another's providers. They support
+dormant model sets, deeply immutable compatibility metadata, atomic
+model-snapshot refresh, per-caller refresh deadlines, retry-safe coalescing, and
+required/optional/no authentication without fake keys or exposed auth provenance.
+Custom auth-resolution exceptions are reduced to a categorical host error during
+runtime creation; Tau's required-key guidance remains actionable.
+
+Phase 1 established the contracts and registry mechanics. The `/local` host now
+provides the generic TUI flow for registered dynamic local backends. Dynamic
+providers still do not become durable catalog entries or automatic startup
+fallbacks: configure a backend, then choose its provider/model explicitly. The
+trusted built-in llama.cpp provider is the narrow scoped-model exception: Tau
+may persist only its stable provider ID plus exact model ID. An unloaded/stale
+reference remains visible as unavailable and cannot trigger load or download.
+User and project dynamic providers cannot opt into durable references. See
+the [local backends guide]({{< relref "./local-inference.md" >}}) and
+[Extensions]({{< relref "./extensions.md#dynamic-providers" >}}).
+
 ## Adding a custom / local provider
 
 Any OpenAI-compatible endpoint works — including local servers like llama.cpp or
@@ -319,43 +347,54 @@ Ollama. The easiest interactive path is:
 Tau prompts for the provider details, saves the API key, writes the provider
 metadata to `~/.tau/catalog.toml`, and makes the provider available immediately.
 
-### llama.cpp quickstart
+### Built-in llama.cpp backend
 
-Tau works with llama.cpp through its OpenAI-compatible server. Start a local
-server with a GGUF model from Hugging Face:
-
-```bash
-llama-server -hf ggml-org/Qwen3.6-35B-A3B-GGUF:Q8_0
-```
-
-Some installs expose the same server as `llama serve`:
+Tau's first-class llama.cpp integration is configured through the provider-neutral
+`/local` command. For download/load/unload management, start llama.cpp
+independently in router mode without a model argument:
 
 ```bash
-llama serve -hf ggml-org/Qwen3.6-35B-A3B-GGUF:Q8_0
+llama-server --models-max 1 --parallel 1 --flash-attn auto
 ```
 
-Then register it with Tau:
+See the [official router guide](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#using-multiple-models)
+and Tau's complete guide below before adding hardware- or model-specific flags.
+
+Then open Tau and run:
+
+```text
+/local
+```
+
+Choose and confirm the recommended `llama.cpp` backend. Tau automatically
+checks the saved, environment, or default endpoint; use **Configure** for a
+server elsewhere and an optional API key. Tau discovers exact loaded model IDs
+through OpenAI-compatible or compatible router discovery; it does not use a
+fake key or fake model. Compatible b9688–b10595 routers show arrow-key
+navigable model states plus explicitly confirmed load, unload, Hugging Face GGUF
+search, and server-side download actions. Load/download confirmations preselect
+Cancel as an unlabelled safety default. Closing `/local` leaves an active
+server-side download running; reopen it to cancel explicitly. No key means no
+`Authorization` header. A saved key takes precedence over `LLAMA_API_KEY`.
+
+Use the discovered ID explicitly from the TUI or print mode:
 
 ```bash
-export LLAMA_API_KEY=local # any non-empty value unless you started llama.cpp with --api-key
-
-tau --provider llama-cpp \
-  --base-url http://localhost:8080/v1 \
-  --api-key-env LLAMA_API_KEY \
-  --model local \
-  setup
+tau --provider llama.cpp --model <model-id>
+tau --provider llama.cpp --model <model-id> --print "summarize this project"
 ```
 
-Run Tau against the local model:
+The configured endpoint and safe model snapshot are stored under
+`~/.tau/state/extensions/llama.cpp.json`; secrets stay in the credential store.
+A cached snapshot allows explicit startup during temporary server downtime.
+`/local` never scans ports or processes, stops the external server, or deletes
+model files. See the [complete llama.cpp guide]({{< relref "./local-inference.md" >}})
+for endpoint precedence, Doctor, reset, and troubleshooting.
 
-```bash
-tau --provider llama-cpp
-tau --provider llama-cpp "summarize this project"    # TUI with an initial prompt
-tau --provider llama-cpp -p "summarize this project" # one-shot print mode
-```
-
-`llama-server` listens on port `8080` by default and only enforces the bearer
-token if you launch it with `--api-key`.
+An older manually configured provider named `llama-cpp` remains separate and is
+not migrated. Configure the built-in `llama.cpp` layer through `/local`, and use
+the custom-provider flow below for Ollama and other OpenAI-compatible servers.
+Tau does not ship an Ollama backend.
 
 For scripted or one-off setup with another OpenAI-compatible server, use the
 same `tau setup` flow. For example, Ollama's OpenAI-compatible endpoint usually
