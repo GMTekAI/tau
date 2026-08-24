@@ -273,7 +273,7 @@ class SessionResources:
     custom_system_prompt: str | None
     custom_system_prompt_path: Path | None
     append_system_prompt: str | None
-    append_system_prompt_path: Path | None
+    append_system_prompt_paths: tuple[Path, ...]
     diagnostics: tuple[ResourceDiagnostic, ...]
 
 
@@ -385,7 +385,7 @@ class CodingSession:
         custom_system_prompt: str | None = None,
         custom_system_prompt_path: Path | None = None,
         append_system_prompt: str | None = None,
-        append_system_prompt_path: Path | None = None,
+        append_system_prompt_paths: tuple[Path, ...] = (),
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
@@ -409,7 +409,7 @@ class CodingSession:
         self._custom_system_prompt = custom_system_prompt
         self._custom_system_prompt_path = custom_system_prompt_path
         self._append_system_prompt = append_system_prompt
-        self._append_system_prompt_path = append_system_prompt_path
+        self._append_system_prompt_paths = append_system_prompt_paths
         self._resource_diagnostics = resource_diagnostics
         self._command_registry = command_registry or create_default_command_registry()
         self._provider_name = config.provider_name
@@ -544,7 +544,6 @@ class CodingSession:
             skills_enabled=config.skills_enabled,
             system_prompt_enabled=config.system is None,
             custom_system_prompt_explicit=config.custom_system_prompt is not None,
-            append_system_prompt_explicit=config.append_system_prompt is not None,
         )
         if summary.categories:
             resources = replace(
@@ -622,10 +621,9 @@ class CodingSession:
                         if config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=(
-                        config.append_system_prompt
-                        if config.append_system_prompt is not None
-                        else resources.append_system_prompt
+                    append_system_prompt=_compose_append_system_prompt(
+                        resources.append_system_prompt,
+                        config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=extension_runtime.prompt_guidelines,
@@ -656,7 +654,7 @@ class CodingSession:
             custom_system_prompt=resources.custom_system_prompt,
             custom_system_prompt_path=resources.custom_system_prompt_path,
             append_system_prompt=resources.append_system_prompt,
-            append_system_prompt_path=resources.append_system_prompt_path,
+            append_system_prompt_paths=resources.append_system_prompt_paths,
             resource_diagnostics=resources.diagnostics,
             command_registry=config.command_registry or extension_runtime.build_command_registry(),
             pending_initial_entries=pending_initial_entries,
@@ -1032,11 +1030,12 @@ class CodingSession:
     @property
     def system_prompt_files(self) -> tuple[Path, ...]:
         """Return active discovered system-prompt resource files."""
-        return tuple(
-            path
-            for path in (self._custom_system_prompt_path, self._append_system_prompt_path)
-            if path is not None
+        custom_paths = (
+            (self._custom_system_prompt_path,)
+            if self._custom_system_prompt_path is not None
+            else ()
         )
+        return (*custom_paths, *self._append_system_prompt_paths)
 
     @property
     def context_token_estimate(self) -> int:
@@ -2013,7 +2012,7 @@ class CodingSession:
             custom_system_prompt=self._custom_system_prompt,
             custom_system_prompt_path=self._custom_system_prompt_path,
             append_system_prompt=self._append_system_prompt,
-            append_system_prompt_path=self._append_system_prompt_path,
+            append_system_prompt_paths=self._append_system_prompt_paths,
         )
         before_extensions = _extension_signatures(self._extension_runtime)
         before_tool_names = tuple(tool.name for tool in self._harness.config.tools)
@@ -2075,7 +2074,6 @@ class CodingSession:
             skills_enabled=self._config.skills_enabled,
             system_prompt_enabled=self._config.system is None,
             custom_system_prompt_explicit=self._config.custom_system_prompt is not None,
-            append_system_prompt_explicit=self._config.append_system_prompt is not None,
         )
         if trust_summary is not None and trust_summary.categories:
             assert staged_resolution is not None
@@ -2119,7 +2117,7 @@ class CodingSession:
             custom_system_prompt=resources.custom_system_prompt,
             custom_system_prompt_path=resources.custom_system_prompt_path,
             append_system_prompt=resources.append_system_prompt,
-            append_system_prompt_path=resources.append_system_prompt_path,
+            append_system_prompt_paths=resources.append_system_prompt_paths,
         )
         after_guidelines = staged_runtime.prompt_guidelines
         after_sections = staged_runtime.prompt_sections
@@ -2141,10 +2139,9 @@ class CodingSession:
                         if self._config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=(
-                        self._config.append_system_prompt
-                        if self._config.append_system_prompt is not None
-                        else resources.append_system_prompt
+                    append_system_prompt=_compose_append_system_prompt(
+                        resources.append_system_prompt,
+                        self._config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=after_guidelines,
@@ -2182,7 +2179,7 @@ class CodingSession:
         self._custom_system_prompt = resources.custom_system_prompt
         self._custom_system_prompt_path = resources.custom_system_prompt_path
         self._append_system_prompt = resources.append_system_prompt
-        self._append_system_prompt_path = resources.append_system_prompt_path
+        self._append_system_prompt_paths = resources.append_system_prompt_paths
         self._resource_diagnostics = resources.diagnostics
         self._command_registry = staged_commands
         self._extension_runtime = staged_runtime
@@ -2537,7 +2534,7 @@ class CodingSession:
         self._custom_system_prompt = replacement._custom_system_prompt
         self._custom_system_prompt_path = replacement._custom_system_prompt_path
         self._append_system_prompt = replacement._append_system_prompt
-        self._append_system_prompt_path = replacement._append_system_prompt_path
+        self._append_system_prompt_paths = replacement._append_system_prompt_paths
         self._resource_diagnostics = replacement._resource_diagnostics
         self._command_registry = replacement._command_registry
         self._provider_name = replacement._provider_name
@@ -4315,7 +4312,7 @@ def _system_prompt_resource_signatures(
     custom_system_prompt: str | None,
     custom_system_prompt_path: Path | None,
     append_system_prompt: str | None,
-    append_system_prompt_path: Path | None,
+    append_system_prompt_paths: tuple[Path, ...],
 ) -> tuple[object, ...]:
     prompt_skills = tuple(
         (skill.name, str(skill.path), skill.description, skill.disable_model_invocation)
@@ -4327,7 +4324,7 @@ def _system_prompt_resource_signatures(
         custom_system_prompt,
         str(custom_system_prompt_path) if custom_system_prompt_path is not None else None,
         append_system_prompt,
-        str(append_system_prompt_path) if append_system_prompt_path is not None else None,
+        tuple(str(path) for path in append_system_prompt_paths),
     )
 
 
@@ -4338,7 +4335,6 @@ def _load_session_resources(
     skills_enabled: bool = True,
     system_prompt_enabled: bool = True,
     custom_system_prompt_explicit: bool = False,
-    append_system_prompt_explicit: bool = False,
 ) -> SessionResources:
     loaded_skills: list[Skill]
     skill_diagnostics: list[ResourceDiagnostic]
@@ -4355,7 +4351,6 @@ def _load_session_resources(
     system_prompts = discover_system_prompt_resources(
         resource_paths,
         custom_prompt_explicit=custom_system_prompt_explicit,
-        append_prompt_explicit=append_system_prompt_explicit,
         enabled=system_prompt_enabled,
     )
     return SessionResources(
@@ -4365,7 +4360,7 @@ def _load_session_resources(
         custom_system_prompt=system_prompts.custom_prompt,
         custom_system_prompt_path=system_prompts.custom_prompt_path,
         append_system_prompt=system_prompts.append_prompt,
-        append_system_prompt_path=system_prompts.append_prompt_path,
+        append_system_prompt_paths=system_prompts.append_prompt_paths,
         diagnostics=tuple(
             [
                 *skill_diagnostics,
@@ -4375,6 +4370,14 @@ def _load_session_resources(
             ]
         ),
     )
+
+
+def _compose_append_system_prompt(*parts: str | None) -> str | None:
+    """Compose discovered and explicit append content in source order."""
+    selected = [part for part in parts if part is not None]
+    if not selected:
+        return None
+    return "\n\n".join(selected)
 
 
 def _merge_context_files(
