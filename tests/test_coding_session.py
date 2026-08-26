@@ -5954,3 +5954,174 @@ def test_minimal_commands_are_handled(tmp_path: Path) -> None:
     assert session.handle_command("/quit").exit_requested is True
     assert session.handle_command("/exit").exit_requested is True
     assert session.handle_command("/unknown").handled is False
+
+
+def _thinking_override_provider_config(  # noqa: D103
+    thinking_defaults: dict[str, str] | None = None,
+) -> OpenAICompatibleProviderConfig:
+    return OpenAICompatibleProviderConfig(
+        name="openai",
+        models=("reasoner",),
+        default_model="reasoner",
+        thinking_levels=("off", "low", "high"),
+        thinking_models=("reasoner",),
+        thinking_default="low",
+        thinking_parameter="reasoning_effort",
+        thinking_defaults=thinking_defaults or {},  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.anyio
+async def test_new_session_initial_thinking_respects_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+    provider_config = _thinking_override_provider_config(thinking_defaults={"reasoner": "low"})
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider([]),
+            model="reasoner",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            provider_name="openai",
+            provider_settings=ProviderSettings(providers=(provider_config,)),
+            thinking_level_override="high",
+        )
+    )
+
+    # The override beats the remembered per-model default ("low").
+    assert session.thinking_level == "high"
+    await session._ensure_session_initialized()
+    entries = await JsonlSessionStorage(tmp_path / "session.jsonl").read_all()
+    thinking_entries = [entry for entry in entries if entry.type == "thinking_level_change"]
+    assert thinking_entries[0].thinking_level == "high"
+
+
+@pytest.mark.anyio
+async def test_resumed_session_thinking_override_is_ephemeral(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+    provider_config = _thinking_override_provider_config()
+    storage_path = tmp_path / "session.jsonl"
+
+    def config(thinking_level_override: object = None) -> CodingSessionConfig:
+        return CodingSessionConfig(
+            provider=FakeProvider([]),
+            model="reasoner",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(storage_path),
+            cwd=tmp_path,
+            provider_name="openai",
+            provider_settings=ProviderSettings(providers=(provider_config,)),
+            thinking_level_override=thinking_level_override,  # type: ignore[arg-type]
+        )
+
+    first = await CodingSession.load(config())
+    assert first.thinking_level == "low"
+    await first._ensure_session_initialized()
+
+    resumed = await CodingSession.load(config(thinking_level_override="high"))
+    assert resumed.thinking_level == "high"
+
+    # The override is ephemeral: a later resume without it uses the stored level.
+    plain = await CodingSession.load(config())
+    assert plain.thinking_level == "low"
+
+    # Resuming with an unsupported override is a strict error, not a fallback.
+    with pytest.raises(ProviderConfigError, match='Thinking mode "medium" is not available'):
+        await CodingSession.load(config(thinking_level_override="medium"))
+
+
+@pytest.mark.anyio
+async def test_thinking_override_unsupported_level_raises_on_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+    provider_config = _thinking_override_provider_config()
+
+    with pytest.raises(ProviderConfigError, match='Thinking mode "medium" is not available'):
+        await CodingSession.load(
+            CodingSessionConfig(
+                provider=FakeProvider([]),
+                model="reasoner",
+                system="You are Tau.",
+                storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+                cwd=tmp_path,
+                provider_name="openai",
+                provider_settings=ProviderSettings(providers=(provider_config,)),
+                thinking_level_override="medium",
+            )
+        )
+
+
+def _dynamic_thinking_override_config(
+    tmp_path: Path,
+    *,
+    thinking_level_override: object,
+) -> CodingSessionConfig:
+    extension = tmp_path / "dynamic_provider.py"
+    extension.write_text(
+        """
+from tau_coding.extensions import DynamicProvider, OpenAICompatibleTransport, ProviderModel
+
+
+def setup(tau):
+    tau.register_provider(DynamicProvider(
+        id="local",
+        display_name="Local",
+        models=(ProviderModel("reasoner", thinking_levels=("off", "high")),),
+        default_model="reasoner",
+        transport=OpenAICompatibleTransport(base_url="http://example.test/v1"),
+    ))
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return CodingSessionConfig(
+        provider=None,
+        model="reasoner",
+        system="You are Tau.",
+        storage=JsonlSessionStorage(tmp_path / "dynamic-session.jsonl"),
+        cwd=tmp_path,
+        provider_name="local",
+        requested_provider="local",
+        requested_model="reasoner",
+        provider_settings=ProviderSettings(),
+        extension_paths=(extension,),
+        extensions_enabled=False,
+        thinking_level_override=thinking_level_override,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.anyio
+async def test_dynamic_provider_accepts_supported_thinking_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+
+    session = await CodingSession.load(
+        _dynamic_thinking_override_config(tmp_path, thinking_level_override="high")
+    )
+
+    assert session.thinking_level == "high"
+    assert session.available_thinking_levels == ("off", "high")
+    await session.aclose()
+
+
+@pytest.mark.anyio
+async def test_dynamic_provider_rejects_unsupported_thinking_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+
+    with pytest.raises(
+        ProviderConfigError,
+        match=(
+            r'Thinking mode "max" is not available for local:reasoner\. '
+            r"Available modes: off, high"
+        ),
+    ):
+        await CodingSession.load(
+            _dynamic_thinking_override_config(tmp_path, thinking_level_override="max")
+        )
