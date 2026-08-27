@@ -152,6 +152,7 @@ from tau_coding.tui.widgets import (
     TranscriptWindowBoundary,
     _comma_list,
     _compact_token_count,
+    _format_milliseconds,
     _sidebar_brand,
     _split_rich_style_colors,
     _styled_cwd,
@@ -233,6 +234,10 @@ class FakeSession:
             cached_input_tokens=1_140_000,
             latest_prompt_tokens=1_200_000,
             latest_cached_input_tokens=1_188_000,
+            timed_output_tokens=48_000,
+            response_duration_ms=1_200_000,
+            time_to_first_output_ms=18_000,
+            timed_first_output_count=15,
             estimated_cost=1.24,
         )
         self.system_prompt = "You are Tau."
@@ -522,6 +527,17 @@ def _visible_footer_bindings(app: TauTuiApp) -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize(
+    ("milliseconds", "expected"),
+    [(999, "999ms"), (1000, "1.0s"), (999.6, "1.0s")],
+)
+def test_format_milliseconds_handles_unit_boundary(
+    milliseconds: float,
+    expected: str,
+) -> None:
+    assert _format_milliseconds(milliseconds) == expected
+
+
 def test_session_sidebar_renders_session_metadata() -> None:
     console = Console(record=True, width=80)
 
@@ -546,6 +562,7 @@ def test_session_sidebar_renders_session_metadata() -> None:
     assert "cumulative usage" not in output
     assert "1.2m in, 48k out · ~$1.24" in output
     assert "cache: 99% latest · 95% session" in output
+    assert "avg TPS: 40.0 · avg TTFT: 1.2s" in output
     assert "auto at 200k" in output
     assert "read, write, edit, bash" in output
     assert re.search(r"\./\.tau/skills\s+• review", output)
