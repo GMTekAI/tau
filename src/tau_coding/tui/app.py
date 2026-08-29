@@ -2585,8 +2585,6 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
 
     def action_toggle_mode(self) -> None:
         """Toggle between all models and scoped models."""
-        if self.picker_kind != "model":
-            return
         self.mode = "scoped" if self.mode == "all" else "all"
         self._refresh_model_list()
 
@@ -2659,12 +2657,23 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         scope_count = len(self.scoped_choices)
         tabs = self.query_one("#model-picker-tabs", Static)
         if self.picker_kind == "scoped":
-            tabs.update("Scoped models setup — Enter toggles membership; active model is unchanged")
-            help_text = (
-                "No matching models - Enter toggles scoped model"
-                if not self.visible_choices
-                else f"Enter toggles scoped model - {scope_count} scoped"
-            )
+            if self.mode == "all":
+                tabs.update("Tabs: ● All models  ○ Scoped models")
+                help_text = (
+                    "all models: no matching models - Tab switches to scoped models"
+                    if not self.visible_choices
+                    else (
+                        "All models - Enter toggles scoped model - Tab switches tabs - "
+                        f"{scope_count} scoped - active model is unchanged"
+                    )
+                )
+            else:
+                tabs.update("Tabs: ○ All models  ● Scoped models")
+                help_text = (
+                    "scoped models: no scoped models - Tab switches to all models"
+                    if not self.visible_choices
+                    else "Scoped models - Enter removes scoped model - Tab switches tabs"
+                )
         elif self.mode == "all":
             tabs.update("Tabs: ● All models  ○ Scoped models")
             help_text = (

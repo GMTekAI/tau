@@ -289,7 +289,8 @@ provider/model access varies by plan and policy.
 - **Ctrl+P** / **Shift+Ctrl+P** — cycle your *scoped* (favorite) models
   forward / backward without opening the picker.
   Build the list with `/scoped-models`, or press `Space` on a model in the
-  `/model` picker.
+  `/model` picker. In the `/scoped-models` modal, press `Tab` to switch to a
+  scoped-only view where `Enter` removes models from the list.
 
 Tau validates the selected model against the active provider's configured model
 list before creating or refreshing a runtime provider. This prevents accidental
